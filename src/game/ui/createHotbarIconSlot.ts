@@ -4,9 +4,12 @@ import { Rectangle } from '@babylonjs/gui/2D/controls/rectangle'
 import { TextBlock } from '@babylonjs/gui/2D/controls/textBlock'
 import type { TooltipManager } from './createTooltipManager'
 
+const HOTBAR_FONT_FAMILY = "'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
+
 export type HotbarIconSlotHandle = {
   badge: TextBlock
   frame: Rectangle
+  hitArea: Rectangle
   icon: Image
   setSource: (value: string) => void
   setTooltipText: (value: string) => void
@@ -51,8 +54,8 @@ export function createHotbarIconSlot(options: CreateHotbarIconSlotOptions): Hotb
 
   const badge = new TextBlock(`hotbar-slot-badge-${options.index}`)
   badge.width = '100%'
-  badge.height = '12px'
-  badge.top = '-2px'
+  badge.height = '14px'
+  badge.top = '-1px'
   badge.color = '#f8f6e7'
   badge.fontSize = 9
   badge.fontWeight = '700'
@@ -63,7 +66,7 @@ export function createHotbarIconSlot(options: CreateHotbarIconSlotOptions): Hotb
   badge.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_RIGHT
   badge.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_BOTTOM
   badge.paddingRight = '5px'
-  badge.fontFamily = "'Courier New','Consolas',monospace"
+  badge.fontFamily = HOTBAR_FONT_FAMILY
   badge.isPointerBlocker = false
   frame.addControl(badge)
 
@@ -95,6 +98,7 @@ export function createHotbarIconSlot(options: CreateHotbarIconSlotOptions): Hotb
   return {
     badge,
     frame,
+    hitArea,
     icon,
     setSource(value: string) {
       icon.name = value

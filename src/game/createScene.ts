@@ -59,10 +59,14 @@ const TRAVEL_MIN_ETA_SECONDS = 2.8
 const TRAVEL_MIN_FUEL_COST = 1.2
 const TRAVEL_ROUTE_MAX_ITERATIONS = 8
 const TRAVEL_ROUTE_CLEARANCE = 2.6
+const SHIP_FUEL_CAPACITY = 60
+const HTML_TEXT_WRAPPING = 4
+const UI_FONT_FAMILY = "'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
 
 type ResourceKind = 'water' | 'ironNickel' | 'copper' | 'silicate' | 'titanium' | 'rareEarth'
 type ResourceInventory = Record<ResourceKind, number>
 type CarryItemId = ResourceKind | 'harvester'
+type FuelTypeId = 'water'
 type CarrySlotItem = {
   amount: number
   itemId: CarryItemId
@@ -79,17 +83,13 @@ type HudState = {
   totalRate: number
 }
 
-type HudBackpackResourceCardHandle = {
-  kind: ResourceKind
+type HudBackpackSlotHandle = {
+  badge: Rectangle
   icon: Image
   panel: Rectangle
   rate: TextBlock
-  value: TextBlock
-}
-
-type HudBackpackSpecialCardHandle = {
-  panel: Rectangle
-  rate: TextBlock
+  setSource: (value: string) => void
+  setTooltipText: (value: string) => void
   value: TextBlock
 }
 
@@ -97,6 +97,19 @@ type HudRecipeCostChipHandle = {
   icon: Image
   panel: Rectangle
   value: TextBlock
+}
+
+type HudShipConsoleSlotHandle = {
+  icon: Image
+  label: TextBlock
+  panel: Rectangle
+  value: TextBlock
+}
+
+type HudShipPanelHandle = {
+  slots: HudShipConsoleSlotHandle[]
+  status: TextBlock
+  panel: Rectangle
 }
 
 type HudWorkshopListEntryHandle = {
@@ -120,9 +133,11 @@ type HudWorkshopDetailHandle = {
 }
 
 type TravelPanelState = {
+  currentFuel: number
   destinationName: string
   etaSeconds: number
   fuelCost: number
+  fuelHint: string
   visible: boolean
 }
 
@@ -263,6 +278,8 @@ type ShipTravelState = {
   etaSeconds: number
   fuelCost: number
   fuelRemainingToBurn: number
+  fuelTypeId: FuelTypeId | null
+  fuelUsagePerDistance: number
   routeWaypoints: Vector3[]
   routeWaypointIndex: number
   source: PlanetGameplayState
@@ -277,8 +294,34 @@ type TravelPlan = {
   distance: number
   etaSeconds: number
   fuelCost: number
+  fuelTypeId: FuelTypeId | null
+  fuelUsagePerDistance: number
   routeWaypoints: Vector3[]
 }
+
+type FuelTypeDefinition = {
+  displayName: string
+  fuelPerDistanceMultiplier: number
+  id: FuelTypeId
+  itemId: CarryItemId
+  speedMultiplier: number
+}
+
+type ShipFuelStatus = {
+  fuelTypeId: FuelTypeId | null
+  isMixed: boolean
+  totalFuel: number
+}
+
+const FUEL_TYPES: FuelTypeDefinition[] = [
+  {
+    displayName: '水',
+    fuelPerDistanceMultiplier: 1,
+    id: 'water',
+    itemId: 'water',
+    speedMultiplier: 1,
+  },
+]
 
 type TravelObstacle = {
   center: Vector3
@@ -941,29 +984,16 @@ export function createScene(
   const systemSeed = Math.floor(Math.random() * 100000)
   const starSystem = generateStarSystemData(systemSeed)
   createStarfieldDome(scene)
+  const backpackSlots: (CarrySlotItem | null)[] = Array.from({ length: 30 }, () => null)
   const hud = createHud(
     scene,
-    (result) => {
-      if (result.itemId === 'harvester') {
-        state.availableHarvesters = Math.max(0, state.availableHarvesters - result.removedFromBackpack)
-      } else {
-        state.resources[result.itemId] = Math.max(0, state.resources[result.itemId] - result.removedFromBackpack)
-      }
-
-      if (result.returnedToBackpack !== null) {
-        if (result.returnedToBackpack.itemId === 'harvester') {
-          state.availableHarvesters += result.returnedToBackpack.amount
-        } else {
-          state.resources[result.returnedToBackpack.itemId] += result.returnedToBackpack.amount
-        }
-      }
-
-      emitHud()
-    },
+    backpackSlots,
     () => {
       fabricateHarvester()
     },
   )
+  hud.storeAcquiredItem('water', 24)
+  hud.storeAcquiredItem('harvester', 1)
   const travelPanel = createTravelPanel(
     scene,
     () => {
@@ -1032,13 +1062,10 @@ export function createScene(
 
   const state = {
     activeHarvesters: 0,
-    availableHarvesters: 1,
+    availableHarvesters: 0,
     hoveredNode: null as ResourceNode | null,
     resourceRates: createEmptyInventory(),
-    resources: {
-      ...createEmptyInventory(),
-      water: 24,
-    },
+    resources: createEmptyInventory(),
     toastMessage: '',
     toastToken: 0,
     totalRate: 0,
@@ -1070,29 +1097,37 @@ export function createScene(
   function updateTravelPanel(): void {
     if (selectedPlanetState === null || travelState !== null) {
       travelPanel.update({
+        currentFuel: 0,
         destinationName: '',
         etaSeconds: 0,
         fuelCost: 0,
+        fuelHint: '',
         visible: false,
       })
       return
     }
 
+    const fuelStatus = hud.getShipFuelStatus()
     const travelPlan = getTravelPlan(
       currentPlanetState.runtime,
       selectedPlanetState.runtime,
       starSystemBackdrop.planets,
       starSystemBackdrop.star,
+      fuelStatus.fuelTypeId,
     )
     travelPanel.update({
+      currentFuel: fuelStatus.totalFuel,
       destinationName: selectedPlanetState.data.name,
       etaSeconds: travelPlan.etaSeconds,
       fuelCost: travelPlan.fuelCost,
+      fuelHint: formatFuelHint(fuelStatus),
       visible: true,
     })
   }
 
   function emitHud(): void {
+    state.resources = getBackpackResourceInventory(backpackSlots)
+    state.availableHarvesters = getBackpackItemCount(backpackSlots, 'harvester') + hud.getCarryItemCount('harvester')
     hud.update({ ...state })
   }
 
@@ -1104,13 +1139,14 @@ export function createScene(
 
   function getUsableResourceInventory(): ResourceInventory {
     const carryInventory = hud.getCarryResourceInventory()
+    const backpackInventory = getBackpackResourceInventory(backpackSlots)
     return {
-      copper: state.resources.copper + carryInventory.copper,
-      ironNickel: state.resources.ironNickel + carryInventory.ironNickel,
-      rareEarth: state.resources.rareEarth + carryInventory.rareEarth,
-      silicate: state.resources.silicate + carryInventory.silicate,
-      titanium: state.resources.titanium + carryInventory.titanium,
-      water: state.resources.water + carryInventory.water,
+      copper: backpackInventory.copper + carryInventory.copper,
+      ironNickel: backpackInventory.ironNickel + carryInventory.ironNickel,
+      rareEarth: backpackInventory.rareEarth + carryInventory.rareEarth,
+      silicate: backpackInventory.silicate + carryInventory.silicate,
+      titanium: backpackInventory.titanium + carryInventory.titanium,
+      water: backpackInventory.water + carryInventory.water,
     }
   }
 
@@ -1120,7 +1156,7 @@ export function createScene(
 
   function spendUsableInventory(cost: UpgradeCost): void {
     const remainingCost = hud.consumeResourcesFromCarry(cost)
-    spendInventory(state.resources, remainingCost)
+    spendBackpackInventory(backpackSlots, remainingCost)
   }
 
   function recalculateNetworkState(): void {
@@ -1259,7 +1295,7 @@ export function createScene(
     }
 
     spendUsableInventory(fabricationCost)
-    state.availableHarvesters += 1
+    hud.storeAcquiredItem('harvester', 1)
     emitToast(`工坊完成 1 台采集器`)
   }
 
@@ -1274,7 +1310,7 @@ export function createScene(
     node.harvester = null
     node.deployed = false
     node.level = 0
-    state.availableHarvesters += 1
+    hud.storeAcquiredItem('harvester', 1)
     recalculateNetworkState()
     setNodeHighlight(node, hoveredNode?.id === node.id)
     emitToast(`已回收 ${node.label} 采集器`)
@@ -1293,7 +1329,7 @@ export function createScene(
       node.harvester = null
       node.deployed = false
       node.level = 0
-      state.availableHarvesters += 1
+      hud.storeAcquiredItem('harvester', 1)
       recycledCount += 1
 
       if (hoveredNode?.id === node.id) {
@@ -1341,14 +1377,26 @@ export function createScene(
       return
     }
 
+    const fuelStatus = hud.getShipFuelStatus()
+    if (fuelStatus.isMixed) {
+      emitToast('飞船燃料混装，先统一推进剂')
+      return
+    }
+
+    if (fuelStatus.fuelTypeId === null || fuelStatus.totalFuel <= 1e-6) {
+      emitToast('飞船还没有装填推进剂')
+      return
+    }
+
     const travelPlan = getTravelPlan(
       currentPlanetState.runtime,
       selectedPlanetState.runtime,
       starSystemBackdrop.planets,
       starSystemBackdrop.star,
+      fuelStatus.fuelTypeId,
     )
-    if (getUsableResourceInventory().water + 1e-6 < travelPlan.fuelCost) {
-      emitToast(`水不足，需要 ${travelPlan.fuelCost.toFixed(1)}`)
+    if (fuelStatus.totalFuel + 1e-6 < travelPlan.fuelCost) {
+      emitToast(`飞船燃料不足，需要 ${travelPlan.fuelCost.toFixed(1)}`)
       return
     }
 
@@ -1362,6 +1410,8 @@ export function createScene(
       etaSeconds: travelPlan.etaSeconds,
       fuelCost: travelPlan.fuelCost,
       fuelRemainingToBurn: travelPlan.fuelCost,
+      fuelTypeId: travelPlan.fuelTypeId,
+      fuelUsagePerDistance: travelPlan.fuelUsagePerDistance,
       routeWaypoints: travelPlan.routeWaypoints,
       routeWaypointIndex: 0,
       source: currentPlanetState,
@@ -1371,6 +1421,7 @@ export function createScene(
       startRadius: camera.radius,
       startTarget: camera.getTarget().clone(),
     }
+    const destinationName = travelState.destination.data.name
     selectedPlanetState = null
     updateTravelPanel()
     setTravelCameraLimits()
@@ -1385,8 +1436,8 @@ export function createScene(
     canvas.style.cursor = 'default'
     emitToast(
       recycledCount > 0
-        ? `已回收 ${recycledCount} 台采集器，启程前往 ${travelState.destination.data.name}`
-        : `启程前往 ${travelState.destination.data.name}`,
+        ? `已回收 ${recycledCount} 台采集器，启程前往 ${destinationName}`
+        : `启程前往 ${destinationName}`,
     )
   }
 
@@ -1495,7 +1546,7 @@ export function createScene(
 
         const extracted = Math.min(node.reserve, getNodeRate(node) * dt)
         node.reserve -= extracted
-        state.resources[node.kind] += extracted
+        hud.storeAcquiredItem(node.kind, extracted)
 
         if (node.reserve <= 0) {
           node.reserve = 0
@@ -1532,7 +1583,7 @@ export function createScene(
         emitToast(`已抵达 ${nextPlanetState.data.name}`)
       },
       (burnedWater) => {
-        spendUsableInventory({ water: burnedWater })
+        hud.consumeShipFuel(burnedWater, travelState?.fuelTypeId ?? null)
       },
     )
 
@@ -1812,7 +1863,8 @@ function createTravelPanel(
       panel.isVisible = state.visible
       panel.alpha = state.visible ? 1 : 0
       destinationName.text = `是否前往 ${state.destinationName} ?`
-      fuelValue.text = `${state.fuelCost.toFixed(1)} 水`
+      hintText.text = state.fuelHint
+      fuelValue.text = `${state.currentFuel.toFixed(1)} -> ${(state.currentFuel - state.fuelCost).toFixed(1)}`
       etaValue.text = `${state.etaSeconds.toFixed(1)} 秒`
       cancelButton.isEnabled = state.visible
       cancelButton.alpha = state.visible ? 1 : 0.5
@@ -1906,10 +1958,14 @@ function getTravelPlan(
   destination: StarSystemPlanetRuntime,
   planets: StarSystemPlanetRuntime[],
   star: Mesh,
+  fuelTypeId: FuelTypeId | null,
 ): TravelPlan {
   const sourcePoint = getShipParkingPosition(source, star)
   const destinationPoint = getShipParkingPosition(destination, star)
   const routeWaypoints = buildTravelRoute(source, destination, planets, star)
+  const fuelType = getFuelTypeDefinition(fuelTypeId)
+  const speedMultiplier = fuelType?.speedMultiplier ?? 1
+  const fuelPerDistanceMultiplier = fuelType?.fuelPerDistanceMultiplier ?? 1
   let distance = 0
   let segmentStart = sourcePoint
 
@@ -1919,12 +1975,16 @@ function getTravelPlan(
   }
 
   distance += Vector3.Distance(segmentStart, destinationPoint)
-  const etaSeconds = Math.max(TRAVEL_MIN_ETA_SECONDS, distance / TRAVEL_SPEED)
-  const fuelCost = Math.max(TRAVEL_MIN_FUEL_COST, distance * TRAVEL_FUEL_PER_DISTANCE)
+  const effectiveSpeed = TRAVEL_SPEED * speedMultiplier
+  const effectiveFuelPerDistance = TRAVEL_FUEL_PER_DISTANCE * fuelPerDistanceMultiplier
+  const etaSeconds = Math.max(TRAVEL_MIN_ETA_SECONDS, distance / effectiveSpeed)
+  const fuelCost = Math.max(TRAVEL_MIN_FUEL_COST, distance * effectiveFuelPerDistance)
   return {
     distance,
     etaSeconds,
     fuelCost,
+    fuelTypeId,
+    fuelUsagePerDistance: effectiveFuelPerDistance,
     routeWaypoints,
   }
 }
@@ -2075,7 +2135,7 @@ function updateShipAndCamera(
     orientShip(ship, toTarget)
     const burnedFuel = Math.min(
       travelState.fuelRemainingToBurn,
-      moveDistance * TRAVEL_FUEL_PER_DISTANCE,
+      moveDistance * travelState.fuelUsagePerDistance,
     )
     travelState.fuelRemainingToBurn -= burnedFuel
     burnFuel(burnedFuel)
@@ -2296,17 +2356,18 @@ function lerp(start: number, end: number, t: number): number {
 
 function createHud(
   scene: Scene,
-  onCarryTransfer: (result: {
-    itemId: CarryItemId
-    removedFromBackpack: number
-    returnedToBackpack: CarrySlotItem | null
-  }) => void,
+  backpackSlots: (CarrySlotItem | null)[],
   onFabricateHarvesterPressed: () => void,
 ): {
+  consumeShipFuel: (amount: number, fuelTypeId: FuelTypeId | null) => number
   consumeSelectedCarryItem: (amount: number) => number
   consumeResourcesFromCarry: (cost: UpgradeCost) => UpgradeCost
+  getCarryItemCount: (itemId: CarryItemId) => number
   getCarryResourceInventory: () => ResourceInventory
   getSelectedCarryItemId: () => CarryItemId | null
+  getShipFuelStatus: () => ShipFuelStatus
+  getShipFuelAmount: () => number
+  storeAcquiredItem: (itemId: CarryItemId, amount: number) => void
   update: (state: HudState) => void
 } {
   const ui = AdvancedDynamicTexture.CreateFullscreenUI('stellar-sea-ui', true, scene)
@@ -2324,47 +2385,476 @@ function createHud(
   tooltipLayer.zIndex = 1000
   ui.addControl(tooltipLayer)
   const tooltip = createTooltipManager(scene, tooltipLayer)
-  const carrySlots: (CarrySlotItem | null)[] = Array.from({ length: 7 }, () => null)
-  let selectedCarrySlotIndex = 0
+  const carrySlots: (CarrySlotItem | null)[] = Array.from({ length: 6 }, () => null)
+  const shipSlots: (CarrySlotItem | null)[] = Array.from({ length: 6 }, () => null)
+  let selectedCarrySlotIndex: number | null = null
+  let selectedBackpackSlotIndex: number | null = null
   let latestState: HudState | null = null
   let redrawHud = () => {}
-
-  function getBackpackItemCount(state: HudState, itemId: CarryItemId): number {
-    return itemId === 'harvester' ? state.availableHarvesters : state.resources[itemId]
+  type InventorySlotKind = 'backpack' | 'carry' | 'ship'
+  type InventorySlotRef = {
+    index: number
+    kind: InventorySlotKind
   }
+  const carrySlotRef = (index: number): InventorySlotRef => ({ index, kind: 'carry' })
+  const backpackSlotRef = (index: number): InventorySlotRef => ({ index, kind: 'backpack' })
+  const shipSlotRef = (index: number): InventorySlotRef => ({ index, kind: 'ship' })
+  let inventoryInteractionMode: 'move' | 'split' = 'move'
+  let pendingSplitSource: InventorySlotRef | null = null
 
   function getSelectedCarrySlot(): CarrySlotItem | null {
-    return carrySlots[selectedCarrySlotIndex]
+    return selectedCarrySlotIndex === null ? null : carrySlots[selectedCarrySlotIndex]
   }
 
-  function requestAssignCarryItem(itemId: CarryItemId): void {
-    if (latestState === null) {
+  function getSelectedCarrySlotRef(): InventorySlotRef | null {
+    return selectedCarrySlotIndex === null ? null : carrySlotRef(selectedCarrySlotIndex)
+  }
+
+  function areSameInventorySlotRefs(a: InventorySlotRef | null, b: InventorySlotRef | null): boolean {
+    return a !== null && b !== null && a.kind === b.kind && a.index === b.index
+  }
+
+  function cloneCarrySlotItem(slot: CarrySlotItem | null): CarrySlotItem | null {
+    return slot === null ? null : { ...slot }
+  }
+
+  function getInventorySlot(ref: InventorySlotRef): CarrySlotItem | null {
+    if (ref.kind === 'backpack') {
+      return backpackSlots[ref.index] ?? null
+    }
+
+    if (ref.kind === 'carry') {
+      return carrySlots[ref.index] ?? null
+    }
+
+    return shipSlots[ref.index] ?? null
+  }
+
+  function setInventorySlot(ref: InventorySlotRef, slot: CarrySlotItem | null): void {
+    if (ref.kind === 'backpack') {
+      backpackSlots[ref.index] = slot
       return
     }
 
-    const backpackAmount = getBackpackItemCount(latestState, itemId)
-    if (backpackAmount <= 0) {
+    if (ref.kind === 'carry') {
+      carrySlots[ref.index] = slot
       return
     }
 
-    const selectedSlot = getSelectedCarrySlot()
-    let returnedToBackpack: CarrySlotItem | null = null
+    shipSlots[ref.index] = slot
+  }
 
-    if (selectedSlot === null) {
-      carrySlots[selectedCarrySlotIndex] = { amount: backpackAmount, itemId }
-    } else if (selectedSlot.itemId === itemId) {
-      selectedSlot.amount += backpackAmount
-    } else {
-      returnedToBackpack = { ...selectedSlot }
-      carrySlots[selectedCarrySlotIndex] = { amount: backpackAmount, itemId }
+  function clearInventorySlotIfEmpty(ref: InventorySlotRef): void {
+    const slot = getInventorySlot(ref)
+    if (slot !== null && slot.amount <= 1e-6) {
+      setInventorySlot(ref, null)
+    }
+  }
+
+  function getInventorySplitAmount(slot: CarrySlotItem | null): number {
+    if (slot === null) {
+      return 0
     }
 
-    onCarryTransfer({
-      itemId,
-      removedFromBackpack: backpackAmount,
-      returnedToBackpack,
-    })
+    if (slot.itemId === 'harvester') {
+      return slot.amount >= 2 ? Math.floor(slot.amount / 2) : 0
+    }
+
+    return slot.amount * 0.5
+  }
+
+  function setInventoryInteractionMode(mode: 'move' | 'split'): void {
+    inventoryInteractionMode = mode
+    pendingSplitSource = null
+    selectedBackpackSlotIndex = null
+  }
+
+  function toggleInventoryInteractionMode(): void {
+    setInventoryInteractionMode(inventoryInteractionMode === 'move' ? 'split' : 'move')
     redrawHud()
+  }
+
+  function handleSplitTap(target: InventorySlotRef): boolean {
+    const targetSlot = getInventorySlot(target)
+    if (pendingSplitSource === null) {
+      if (getInventorySplitAmount(targetSlot) <= 1e-6) {
+        return false
+      }
+
+      pendingSplitSource = target
+      return true
+    }
+
+    if (areSameInventorySlotRefs(pendingSplitSource, target)) {
+      pendingSplitSource = null
+      return true
+    }
+
+    const sourceSlot = getInventorySlot(pendingSplitSource)
+    if (sourceSlot === null) {
+      pendingSplitSource = null
+      return true
+    }
+
+    const moved = movePartialInventoryAmount(
+      pendingSplitSource,
+      target,
+      getInventorySplitAmount(sourceSlot),
+    )
+    pendingSplitSource = null
+    return moved
+  }
+
+  function getShipFuelStatusForSlots(slots: (CarrySlotItem | null)[]): ShipFuelStatus {
+    let totalFuel = 0
+    let fuelTypeId: FuelTypeId | null = null
+    let isMixed = false
+
+    for (const slot of slots) {
+      if (slot === null) {
+        continue
+      }
+
+      const slotFuelTypeId = getFuelTypeForItem(slot.itemId)
+      if (slotFuelTypeId === null) {
+        continue
+      }
+
+      totalFuel += slot.amount
+      if (fuelTypeId === null) {
+        fuelTypeId = slotFuelTypeId
+        continue
+      }
+
+      if (fuelTypeId !== slotFuelTypeId) {
+        isMixed = true
+      }
+    }
+
+    return {
+      fuelTypeId: isMixed ? null : fuelTypeId,
+      isMixed,
+      totalFuel,
+    }
+  }
+
+  function getShipFuelStatus(): ShipFuelStatus {
+    return getShipFuelStatusForSlots(shipSlots)
+  }
+
+  function getRemainingShipFuelCapacity(): number {
+    return Math.max(0, SHIP_FUEL_CAPACITY - getShipFuelStatus().totalFuel)
+  }
+
+  function getShipFuelAmount(): number {
+    return getShipFuelStatus().totalFuel
+  }
+
+  function moveWholeInventorySlot(source: InventorySlotRef, target: InventorySlotRef): boolean {
+    if (areSameInventorySlotRefs(source, target)) {
+      return false
+    }
+
+    const sourceSlot = getInventorySlot(source)
+    if (sourceSlot === null) {
+      return false
+    }
+
+    const targetSlot = getInventorySlot(target)
+    if (target.kind === 'ship') {
+      if (targetSlot === null) {
+        const sourceFuelTypeId = getFuelTypeForItem(sourceSlot.itemId)
+        if (sourceFuelTypeId === null) {
+          setInventorySlot(target, cloneCarrySlotItem(sourceSlot))
+          setInventorySlot(source, null)
+          return true
+        }
+
+        const movedAmount = Math.min(sourceSlot.amount, getRemainingShipFuelCapacity())
+        if (movedAmount <= 1e-6) {
+          return false
+        }
+
+        setInventorySlot(target, {
+          amount: movedAmount,
+          itemId: sourceSlot.itemId,
+        })
+        sourceSlot.amount -= movedAmount
+        clearInventorySlotIfEmpty(source)
+        return true
+      }
+
+      if (targetSlot.itemId === sourceSlot.itemId) {
+        const sourceFuelTypeId = getFuelTypeForItem(sourceSlot.itemId)
+        const movedAmount = sourceFuelTypeId === null
+          ? sourceSlot.amount
+          : Math.min(sourceSlot.amount, getRemainingShipFuelCapacity())
+        if (movedAmount <= 1e-6) {
+          return false
+        }
+
+        targetSlot.amount += movedAmount
+        sourceSlot.amount -= movedAmount
+        clearInventorySlotIfEmpty(source)
+        return true
+      }
+
+      const nextShipSlots = shipSlots.map((slot, index) =>
+        index === target.index ? cloneCarrySlotItem(sourceSlot) : cloneCarrySlotItem(slot),
+      )
+      const nextFuelStatus = getShipFuelStatusForSlots(nextShipSlots)
+      if (nextFuelStatus.totalFuel > SHIP_FUEL_CAPACITY + 1e-6) {
+        return false
+      }
+
+      setInventorySlot(target, cloneCarrySlotItem(sourceSlot))
+      setInventorySlot(source, cloneCarrySlotItem(targetSlot))
+      return true
+    }
+
+    if (source.kind === 'ship') {
+      if (targetSlot === null) {
+        setInventorySlot(target, cloneCarrySlotItem(sourceSlot))
+        setInventorySlot(source, null)
+        return true
+      }
+
+      if (targetSlot.itemId === sourceSlot.itemId) {
+        targetSlot.amount += sourceSlot.amount
+        setInventorySlot(source, null)
+        return true
+      }
+
+      const nextShipSlots = shipSlots.map((slot, index) =>
+        index === source.index ? cloneCarrySlotItem(targetSlot) : cloneCarrySlotItem(slot),
+      )
+      const nextFuelStatus = getShipFuelStatusForSlots(nextShipSlots)
+      if (nextFuelStatus.totalFuel > SHIP_FUEL_CAPACITY + 1e-6) {
+        return false
+      }
+
+      setInventorySlot(target, cloneCarrySlotItem(sourceSlot))
+      setInventorySlot(source, cloneCarrySlotItem(targetSlot))
+      return true
+    }
+
+    if (targetSlot === null) {
+      setInventorySlot(target, cloneCarrySlotItem(sourceSlot))
+      setInventorySlot(source, null)
+      return true
+    }
+
+    if (targetSlot.itemId === sourceSlot.itemId) {
+      targetSlot.amount += sourceSlot.amount
+      setInventorySlot(source, null)
+      return true
+    }
+
+    setInventorySlot(target, cloneCarrySlotItem(sourceSlot))
+    setInventorySlot(source, cloneCarrySlotItem(targetSlot))
+    return true
+  }
+
+  function movePartialInventoryAmount(source: InventorySlotRef, target: InventorySlotRef, amount: number): boolean {
+    if (amount <= 1e-6 || areSameInventorySlotRefs(source, target)) {
+      return false
+    }
+
+    const sourceSlot = getInventorySlot(source)
+    if (sourceSlot === null || sourceSlot.amount <= amount - 1e-6) {
+      return false
+    }
+
+    const targetSlot = getInventorySlot(target)
+    if (targetSlot !== null && targetSlot.itemId !== sourceSlot.itemId) {
+      return false
+    }
+
+    if (target.kind === 'ship') {
+      const sourceFuelTypeId = getFuelTypeForItem(sourceSlot.itemId)
+      const movedAmount = sourceFuelTypeId === null ? amount : Math.min(amount, getRemainingShipFuelCapacity())
+      if (movedAmount <= 1e-6) {
+        return false
+      }
+
+      if (targetSlot === null) {
+        setInventorySlot(target, {
+          amount: movedAmount,
+          itemId: sourceSlot.itemId,
+        })
+      } else {
+        targetSlot.amount += movedAmount
+      }
+      sourceSlot.amount -= movedAmount
+      clearInventorySlotIfEmpty(source)
+      return true
+    }
+
+    if (targetSlot === null) {
+      setInventorySlot(target, {
+        amount,
+        itemId: sourceSlot.itemId,
+      })
+    } else {
+      targetSlot.amount += amount
+    }
+    sourceSlot.amount -= amount
+    clearInventorySlotIfEmpty(source)
+    return true
+  }
+
+  function getPreferredCarrySplitTarget(source: InventorySlotRef): InventorySlotRef | null {
+    const sourceSlot = getInventorySlot(source)
+    if (sourceSlot === null) {
+      return null
+    }
+
+    const preferredTarget = getSelectedCarrySlotRef()
+    if (
+      preferredTarget !== null
+      && !areSameInventorySlotRefs(source, preferredTarget)
+      && (getInventorySlot(preferredTarget) === null || getInventorySlot(preferredTarget)?.itemId === sourceSlot.itemId)
+    ) {
+      return preferredTarget
+    }
+
+    const emptyCarryIndex = carrySlots.findIndex((slot, index) => {
+      if (source.kind === 'carry' && source.index === index) {
+        return false
+      }
+
+      return slot === null
+    })
+    if (emptyCarryIndex !== -1) {
+      return carrySlotRef(emptyCarryIndex)
+    }
+
+    const mergeCarryIndex = carrySlots.findIndex((slot, index) => {
+      if (source.kind === 'carry' && source.index === index) {
+        return false
+      }
+
+      return slot?.itemId === sourceSlot.itemId
+    })
+    return mergeCarryIndex === -1 ? null : carrySlotRef(mergeCarryIndex)
+  }
+
+  function splitSelectedCarryIntoTarget(target: InventorySlotRef): boolean {
+    const source = getSelectedCarrySlotRef()
+    if (source === null) {
+      return false
+    }
+
+    const splitAmount = getInventorySplitAmount(getInventorySlot(source))
+    if (splitAmount <= 1e-6) {
+      return false
+    }
+
+    return movePartialInventoryAmount(source, target, splitAmount)
+  }
+
+  function transferBetweenCarryAndShip(shipSlotIndex: number): void {
+    const carryRef = getSelectedCarrySlotRef()
+    const source = carryRef === null || getInventorySlot(carryRef) === null ? shipSlotRef(shipSlotIndex) : carryRef
+    const target = source.kind === 'carry' ? shipSlotRef(shipSlotIndex) : carryRef
+    if (target !== null && moveWholeInventorySlot(source, target)) {
+      selectedBackpackSlotIndex = null
+      redrawHud()
+    }
+  }
+
+  function transferBetweenCarryAndBackpack(slotIndex: number): void {
+    const carryRef = getSelectedCarrySlotRef()
+    if (carryRef !== null) {
+      const carrySlot = getInventorySlot(carryRef)
+      const backpackRef = backpackSlotRef(slotIndex)
+      const source = carrySlot === null ? backpackRef : carryRef
+      const target = carrySlot === null ? carryRef : backpackRef
+      if (moveWholeInventorySlot(source, target)) {
+        selectedBackpackSlotIndex = null
+        redrawHud()
+      }
+      return
+    }
+
+    if (selectedBackpackSlotIndex === null) {
+      if (backpackSlots[slotIndex] !== null) {
+        selectedBackpackSlotIndex = slotIndex
+        redrawHud()
+      }
+      return
+    }
+
+    if (selectedBackpackSlotIndex === slotIndex) {
+      selectedBackpackSlotIndex = null
+      redrawHud()
+      return
+    }
+
+    if (moveWholeInventorySlot(backpackSlotRef(selectedBackpackSlotIndex), backpackSlotRef(slotIndex))) {
+      selectedBackpackSlotIndex = null
+      redrawHud()
+    }
+  }
+
+  function splitBackpackSlot(index: number): void {
+    const source = backpackSlotRef(index)
+    const sourceSlot = getInventorySlot(source)
+    if (sourceSlot === null) {
+      if (splitSelectedCarryIntoTarget(source)) {
+        redrawHud()
+      }
+      return
+    }
+
+    const target = getPreferredCarrySplitTarget(source)
+    if (target === null) {
+      return
+    }
+
+    if (movePartialInventoryAmount(source, target, getInventorySplitAmount(sourceSlot))) {
+      redrawHud()
+    }
+  }
+
+  function splitCarrySlot(index: number): void {
+    const source = carrySlotRef(index)
+    const sourceSlot = getInventorySlot(source)
+    if (sourceSlot === null) {
+      if (index !== selectedCarrySlotIndex && splitSelectedCarryIntoTarget(source)) {
+        redrawHud()
+      }
+      return
+    }
+
+    const target = getPreferredCarrySplitTarget(source)
+    if (target === null) {
+      return
+    }
+
+    if (movePartialInventoryAmount(source, target, getInventorySplitAmount(sourceSlot))) {
+      redrawHud()
+    }
+  }
+
+  function splitShipSlot(index: number): void {
+    const source = shipSlotRef(index)
+    const sourceSlot = getInventorySlot(source)
+    if (sourceSlot === null) {
+      if (splitSelectedCarryIntoTarget(source)) {
+        redrawHud()
+      }
+      return
+    }
+
+    const target = getPreferredCarrySplitTarget(source)
+    if (target === null) {
+      return
+    }
+
+    if (movePartialInventoryAmount(source, target, getInventorySplitAmount(sourceSlot))) {
+      redrawHud()
+    }
   }
 
   const backpackPanel = createFixedPanel('0px', '-110px', '420px', '520px')
@@ -2383,10 +2873,11 @@ function createHud(
   const backpackTitle = createText('背包', 18, '#2a2a2a', 24, true)
   backpackTitle.width = '100%'
   backpackTitle.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  backpackTitle.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   backpackTitle.top = '10px'
   backpackTitle.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   backpackTitle.outlineWidth = 0
-  backpackTitle.fontFamily = "'Courier New','Consolas',monospace"
+  backpackTitle.fontFamily = UI_FONT_FAMILY
   backpackPanel.addControl(backpackTitle)
 
   const backpackGrid = new Rectangle('backpack-grid')
@@ -2400,34 +2891,33 @@ function createHud(
   backpackGrid.isPointerBlocker = false
   backpackPanel.addControl(backpackGrid)
 
-  for (let index = 0; index < 30; index += 1) {
-    createBackpackEmptySlot(backpackGrid, index)
-  }
+  const backpackSlotHandles = Array.from({ length: 30 }, (_, index) => {
+    const handle = createBackpackSlot(backpackGrid, tooltip, index)
+    handle.panel.isPointerBlocker = true
+    handle.panel.hoverCursor = 'pointer'
+    handle.panel.onPointerDownObservable.add((coordinates) => {
+      if (coordinates.buttonIndex === 2) {
+        splitBackpackSlot(index)
+        return
+      }
 
-  const backpackCards = RESOURCE_KINDS.map((kind, index) =>
-    createBackpackResourceCard(backpackGrid, tooltip, kind, index),
-  )
-  for (const card of backpackCards) {
-    card.panel.isPointerBlocker = true
-    card.panel.hoverCursor = 'pointer'
-    card.panel.onPointerClickObservable.add(() => {
-      requestAssignCarryItem(card.kind)
+      if (coordinates.buttonIndex !== 0) {
+        return
+      }
+
+      if (inventoryInteractionMode === 'split') {
+        if (handleSplitTap(backpackSlotRef(index))) {
+          redrawHud()
+        }
+        return
+      }
+
+      transferBetweenCarryAndBackpack(index)
     })
-  }
-  const harvesterBackpackCard = createBackpackSpecialCard(
-    backpackGrid,
-    tooltip,
-    6,
-    '/gui/harvester.svg',
-    '采集器库存',
-  )
-  harvesterBackpackCard.panel.isPointerBlocker = true
-  harvesterBackpackCard.panel.hoverCursor = 'pointer'
-  harvesterBackpackCard.panel.onPointerClickObservable.add(() => {
-    requestAssignCarryItem('harvester')
+    return handle
   })
 
-  const workshopPanel = createFixedPanel('0px', '-110px', '484px', '336px')
+  const workshopPanel = createFixedPanel('0px', '-118px', '648px', '430px')
   workshopPanel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   workshopPanel.verticalAlignment = Control.VERTICAL_ALIGNMENT_BOTTOM
   workshopPanel.thickness = 2
@@ -2440,19 +2930,20 @@ function createHud(
   workshopPanel.zIndex = 1100
   ui.addControl(workshopPanel)
 
-  const workshopTitle = createText('工具台', 18, '#2a2a2a', 24, true)
+  const workshopTitle = createText('制造中心', 18, '#2a2a2a', 24, true)
   workshopTitle.width = '100%'
   workshopTitle.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  workshopTitle.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   workshopTitle.top = '10px'
   workshopTitle.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   workshopTitle.outlineWidth = 0
-  workshopTitle.fontFamily = "'Courier New','Consolas',monospace"
+  workshopTitle.fontFamily = UI_FONT_FAMILY
   workshopPanel.addControl(workshopTitle)
 
   const workshopSearch = new InputText('workshop-search')
-  workshopSearch.width = '170px'
+  workshopSearch.width = '220px'
   workshopSearch.height = '28px'
-  workshopSearch.left = '-146px'
+  workshopSearch.left = '-188px'
   workshopSearch.top = '42px'
   workshopSearch.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   workshopSearch.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
@@ -2463,11 +2954,11 @@ function createHud(
   workshopSearch.placeholderText = '搜索物品'
   workshopSearch.placeholderColor = '#707070'
   workshopSearch.fontSize = 12
-  workshopSearch.fontFamily = "'Courier New','Consolas',monospace"
+  workshopSearch.fontFamily = UI_FONT_FAMILY
   workshopSearch.text = ''
   workshopPanel.addControl(workshopSearch)
 
-  const workshopList = createFixedPanel('-146px', '84px', '170px', '212px')
+  const workshopList = createFixedPanel('-188px', '84px', '220px', '320px')
   workshopList.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   workshopList.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   workshopList.cornerRadius = 2
@@ -2479,14 +2970,14 @@ function createHud(
   workshopPanel.addControl(workshopList)
 
   const workshopDetail = createWorkshopDetailPanel(workshopPanel)
-  workshopDetail.panel.left = '94px'
+  workshopDetail.panel.left = '122px'
   workshopDetail.panel.top = '42px'
 
   const workshopCatalog = [
     {
       actionLabel: '制造',
       description: '部署到资源节点后会持续采集资源。再次点击已部署节点时可继续升级采集效率。',
-      effect: '用途: 增加 1 台可部署采集器，离开星球时会自动回收。',
+      effect: '增加 1 台可部署采集器，离开星球时会自动回收。',
       icon: '/gui/harvester.svg',
       id: 'harvester',
       keywords: ['采集器', '收集', '部署', 'harvester'],
@@ -2522,7 +3013,33 @@ function createHud(
     }
   })
 
-  const hotbar = createFixedPanel('0px', '-14px', '404px', '54px')
+  const shipPanel = createShipPanel(ui)
+  for (let index = 0; index < shipPanel.slots.length; index += 1) {
+    const slotHandle = shipPanel.slots[index]
+    slotHandle.panel.isPointerBlocker = true
+    slotHandle.panel.hoverCursor = 'pointer'
+    slotHandle.panel.onPointerDownObservable.add((coordinates) => {
+      if (coordinates.buttonIndex === 2) {
+        splitShipSlot(index)
+        return
+      }
+
+      if (coordinates.buttonIndex !== 0) {
+        return
+      }
+
+      if (inventoryInteractionMode === 'split') {
+        if (handleSplitTap(shipSlotRef(index))) {
+          redrawHud()
+        }
+        return
+      }
+
+      transferBetweenCarryAndShip(index)
+    })
+  }
+
+  const hotbar = createFixedPanel('0px', '-14px', '492px', '54px')
   hotbar.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   hotbar.verticalAlignment = Control.VERTICAL_ALIGNMENT_BOTTOM
   hotbar.cornerRadius = 2
@@ -2533,7 +3050,7 @@ function createHud(
   hotbar.zIndex = 1200
   ui.addControl(hotbar)
 
-  let activePanel: 'none' | 'backpack' | 'workshop' = 'none'
+  let activePanel: 'none' | 'backpack' | 'ship' | 'workshop' = 'none'
 
   const backpackSlot = createHotbarIconSlot({
     index: 0,
@@ -2553,23 +3070,73 @@ function createHud(
     parent: hotbar,
     source: '/gui/workshop.svg',
     tooltip,
-    tooltipText: '工具台',
+    tooltipText: '制造中心',
   })
-  const carrySlotHandles = Array.from({ length: 7 }, (_, index) =>
+  const shipSlot = createHotbarIconSlot({
+    index: 2,
+    onPress: () => {
+      activePanel = activePanel === 'ship' ? 'none' : 'ship'
+    },
+    parent: hotbar,
+    source: '/gui/ship.svg',
+    tooltip,
+    tooltipText: '飞船',
+  })
+  const splitModeSlot = createHotbarIconSlot({
+    index: 9,
+    onPress: () => {
+      toggleInventoryInteractionMode()
+    },
+    parent: hotbar,
+    source: '/gui/status.svg',
+    tooltip,
+    tooltipText: '拆分模式',
+  })
+  const carrySlotHandles = Array.from({ length: 6 }, (_, index) =>
     createHotbarIconSlot({
-      index: index + 2,
-      onPress: () => {
-        selectedCarrySlotIndex = index
-        if (latestState !== null) {
-          redrawHud()
-        }
-      },
+      index: index + 3,
       parent: hotbar,
       source: '/gui/status.svg',
       tooltip,
       tooltipText: '空携带槽',
     }),
   )
+
+  for (let index = 0; index < carrySlotHandles.length; index += 1) {
+    const handle = carrySlotHandles[index]
+    handle.hitArea.onPointerDownObservable.add((coordinates) => {
+      if (coordinates.buttonIndex === 2) {
+        splitCarrySlot(index)
+        return
+      }
+
+      if (coordinates.buttonIndex !== 0) {
+        return
+      }
+
+      if (inventoryInteractionMode === 'split') {
+        if (handleSplitTap(carrySlotRef(index))) {
+          redrawHud()
+        }
+        return
+      }
+
+      const wasSelectedCarrySlot = selectedCarrySlotIndex === index
+      selectedBackpackSlotIndex = null
+      selectedCarrySlotIndex = index
+      const source = carrySlotRef(index)
+      const sourceSlot = getInventorySlot(source)
+      if (sourceSlot === null) {
+        selectedCarrySlotIndex = wasSelectedCarrySlot ? null : index
+        redrawHud()
+        return
+      }
+
+      if (latestState !== null) {
+        redrawHud()
+      }
+    })
+  }
 
   const toastPanel = createFixedPanel('0px', '18px', '280px', '50px')
   toastPanel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
@@ -2623,6 +3190,32 @@ function createHud(
   let lastToastToken = -1
 
   const hudController = {
+    consumeShipFuel(amount: number, fuelTypeId: FuelTypeId | null): number {
+      let remaining = amount
+      let consumed = 0
+      for (const slot of shipSlots) {
+        const slotFuelTypeId = slot === null ? null : getFuelTypeForItem(slot.itemId)
+        if (slot === null || slotFuelTypeId === null || remaining <= 1e-6) {
+          continue
+        }
+
+        if (fuelTypeId !== null && slotFuelTypeId !== fuelTypeId) {
+          continue
+        }
+
+        const delta = Math.min(slot.amount, remaining)
+        slot.amount -= delta
+        remaining -= delta
+        consumed += delta
+        if (slot.amount <= 1e-6) {
+          const slotIndex = shipSlots.indexOf(slot)
+          if (slotIndex !== -1) {
+            shipSlots[slotIndex] = null
+          }
+        }
+      }
+      return consumed
+    },
     consumeSelectedCarryItem(amount: number): number {
       const slot = getSelectedCarrySlot()
       if (slot === null) {
@@ -2631,7 +3224,7 @@ function createHud(
 
       const consumed = Math.min(slot.amount, amount)
       slot.amount -= consumed
-      if (slot.amount <= 1e-6) {
+      if (slot.amount <= 1e-6 && selectedCarrySlotIndex !== null) {
         carrySlots[selectedCarrySlotIndex] = null
       }
       return consumed
@@ -2660,6 +3253,9 @@ function createHud(
       }
       return remainingCost
     },
+    getCarryItemCount(itemId: CarryItemId): number {
+      return getBackpackItemCount(carrySlots, itemId)
+    },
     getCarryResourceInventory(): ResourceInventory {
       const inventory = createEmptyInventory()
       for (const slot of carrySlots) {
@@ -2671,46 +3267,64 @@ function createHud(
       return inventory
     },
     getSelectedCarryItemId: () => getSelectedCarrySlot()?.itemId ?? null,
-    update(state: HudState) {
-      latestState = state
-      let visibleBackpackSlotIndex = 0
-      for (const card of backpackCards) {
-        const amount = state.resources[card.kind]
-        const rate = state.resourceRates[card.kind]
-        const visible = amount > 0 || rate > 0
-        card.value.text = amount.toFixed(1)
-        card.rate.text = rate > 0 ? `+${rate.toFixed(1)}` : ''
-        card.panel.alpha = 1
-        card.panel.color = getSelectedCarrySlot()?.itemId === card.kind
-          ? '#ffffff'
-          : carrySlots.some((slot) => slot?.itemId === card.kind)
-            ? '#d6c685'
-            : '#2f2f2f'
-        card.panel.isVisible = visible
-        card.panel.isPointerBlocker = visible
-        if (visible) {
-          const { left, top } = getBackpackSlotPosition(visibleBackpackSlotIndex)
-          card.panel.left = left
-          card.panel.top = top
-          visibleBackpackSlotIndex += 1
-        }
+    getShipFuelStatus,
+    getShipFuelAmount,
+    storeAcquiredItem(itemId: CarryItemId, amount: number): void {
+      if (addItemToBackpackSlots(carrySlots, itemId, amount)) {
+        return
       }
 
-      const harvesterVisible = state.availableHarvesters > 0
-      harvesterBackpackCard.value.text = state.availableHarvesters.toFixed(0)
-      harvesterBackpackCard.rate.text = ''
-      harvesterBackpackCard.panel.alpha = 1
-      harvesterBackpackCard.panel.color = getSelectedCarrySlot()?.itemId === 'harvester'
-        ? '#ffffff'
-        : carrySlots.some((slot) => slot?.itemId === 'harvester')
-          ? '#d6c685'
-          : '#2f2f2f'
-      harvesterBackpackCard.panel.isVisible = harvesterVisible
-      harvesterBackpackCard.panel.isPointerBlocker = harvesterVisible
-      if (harvesterVisible) {
-        const { left, top } = getBackpackSlotPosition(visibleBackpackSlotIndex)
-        harvesterBackpackCard.panel.left = left
-        harvesterBackpackCard.panel.top = top
+      addItemToBackpackSlots(backpackSlots, itemId, amount)
+    },
+    update(state: HudState) {
+      latestState = state
+      if (pendingSplitSource !== null && getInventorySlot(pendingSplitSource) === null) {
+        pendingSplitSource = null
+      }
+      const selectedCarrySlot = getSelectedCarrySlot()
+      for (let index = 0; index < backpackSlotHandles.length; index += 1) {
+        const handle = backpackSlotHandles[index]
+        const slot = backpackSlots[index]
+        if (slot === null) {
+          handle.setSource('')
+          handle.setTooltipText(`空背包槽 ${index + 1}`)
+          handle.icon.alpha = 0
+          handle.badge.isVisible = false
+          handle.value.text = ''
+          handle.rate.text = ''
+          handle.panel.color = areSameInventorySlotRefs(pendingSplitSource, backpackSlotRef(index))
+            ? '#f0b45f'
+            : selectedBackpackSlotIndex === index
+              ? '#ffffff'
+            : selectedCarrySlot === null
+              ? '#2f2f2f'
+              : '#3f6d4a'
+          continue
+        }
+
+        const icon = slot.itemId === 'harvester' ? '/gui/harvester.svg' : getResourceUi(slot.itemId).icon
+        const label = slot.itemId === 'harvester' ? '采集器' : getKindLabel(slot.itemId)
+        const countText = formatCarrySlotCount(slot.amount)
+        const rate = slot.itemId === 'harvester'
+          ? 0
+          : state.resourceRates[slot.itemId]
+        handle.setSource(icon)
+        handle.setTooltipText(`背包槽 ${index + 1}: ${label} x${countText}`)
+        handle.icon.alpha = 1
+        handle.badge.isVisible = true
+        handle.value.text = countText
+        handle.rate.text = rate > 0 && findBackpackSlotIndex(backpackSlots, slot.itemId) === index
+          ? `+${rate.toFixed(1)}`
+          : ''
+        handle.panel.color = areSameInventorySlotRefs(pendingSplitSource, backpackSlotRef(index))
+          ? '#f0b45f'
+          : selectedBackpackSlotIndex === index
+            ? '#ffffff'
+          : selectedCarrySlot === null
+            ? '#2f2f2f'
+            : selectedCarrySlot.itemId === slot.itemId
+              ? '#d6c685'
+              : '#6b88a0'
       }
 
       for (let index = 0; index < carrySlotHandles.length; index += 1) {
@@ -2734,6 +3348,10 @@ function createHud(
         handle.badge.text = formatCarrySlotCount(count)
         handle.badge.isVisible = true
         setHotbarIconSlotState(handle, selectedCarrySlotIndex === index, true)
+        if (areSameInventorySlotRefs(pendingSplitSource, carrySlotRef(index))) {
+          handle.frame.color = '#f0b45f'
+          handle.frame.background = '#6d5536ef'
+        }
       }
 
       let visibleWorkshopIndex = 0
@@ -2773,12 +3391,60 @@ function createHud(
             },
       )
 
+      const shipFuelStatus = getShipFuelStatus()
+      const fuelType = getFuelTypeDefinition(shipFuelStatus.fuelTypeId)
+      if (shipFuelStatus.isMixed) {
+        shipPanel.status.text = '燃料混装，无法起飞'
+      } else if (fuelType !== null) {
+        shipPanel.status.text = `燃料 ${fuelType.displayName} ${shipFuelStatus.totalFuel.toFixed(1)} / ${SHIP_FUEL_CAPACITY.toFixed(1)} | 航速 x${fuelType.speedMultiplier.toFixed(2)} | 油耗 x${fuelType.fuelPerDistanceMultiplier.toFixed(2)}`
+      } else {
+        shipPanel.status.text = `未装填推进剂 | 容量 0.0 / ${SHIP_FUEL_CAPACITY.toFixed(1)}`
+      }
+      for (let index = 0; index < shipPanel.slots.length; index += 1) {
+        const slotHandle = shipPanel.slots[index]
+        const shipSlot = shipSlots[index]
+        if (shipSlot === null) {
+          slotHandle.icon.source = ''
+          slotHandle.icon.alpha = 0
+          slotHandle.value.text = ''
+          slotHandle.label.text = `挂载 ${index + 1}`
+          slotHandle.panel.color = '#4f4f4f'
+          continue
+        }
+
+        slotHandle.icon.source = shipSlot.itemId === 'harvester' ? '/gui/harvester.svg' : getResourceUi(shipSlot.itemId).icon
+        slotHandle.icon.alpha = 1
+        slotHandle.value.text = formatCarrySlotCount(shipSlot.amount)
+        slotHandle.label.text = shipSlot.itemId === 'water'
+          ? `燃料 ${index + 1}`
+          : shipSlot.itemId === 'harvester'
+            ? '采集器'
+            : getKindLabel(shipSlot.itemId)
+        slotHandle.panel.color = areSameInventorySlotRefs(pendingSplitSource, shipSlotRef(index))
+          ? '#f0b45f'
+          : shipSlot.itemId === 'water'
+            ? '#7bdbd8'
+            : '#d6c685'
+      }
+
       backpackPanel.isVisible = activePanel === 'backpack'
+      shipPanel.panel.isVisible = activePanel === 'ship'
       workshopPanel.isVisible = activePanel === 'workshop'
       setHotbarIconSlotState(backpackSlot, activePanel === 'backpack', true)
       setHotbarIconSlotState(workshopSlot, activePanel === 'workshop', true)
+      setHotbarIconSlotState(shipSlot, activePanel === 'ship', true)
+      setHotbarIconSlotState(splitModeSlot, inventoryInteractionMode === 'split', true)
       backpackSlot.badge.isVisible = false
+      shipSlot.badge.isVisible = false
       workshopSlot.badge.isVisible = false
+      splitModeSlot.badge.isVisible = true
+      splitModeSlot.badge.text = '拆'
+      splitModeSlot.icon.alpha = 1
+      splitModeSlot.setTooltipText(
+        inventoryInteractionMode === 'split'
+          ? '拆分模式: 开'
+          : '拆分模式: 关',
+      )
 
       if (state.hoveredNode === null) {
         targetMarker.isVisible = false
@@ -2818,13 +3484,36 @@ function createHud(
   return hudController
 }
 
-function createBackpackResourceCard(
+function getFuelTypeForItem(itemId: CarryItemId): FuelTypeId | null {
+  return FUEL_TYPES.find((fuelType) => fuelType.itemId === itemId)?.id ?? null
+}
+
+function getFuelTypeDefinition(fuelTypeId: FuelTypeId | null): FuelTypeDefinition | null {
+  if (fuelTypeId === null) {
+    return null
+  }
+
+  return FUEL_TYPES.find((fuelType) => fuelType.id === fuelTypeId) ?? null
+}
+
+function formatFuelHint(fuelStatus: ShipFuelStatus): string {
+  if (fuelStatus.isMixed) {
+    return '推进剂混装，无法起飞'
+  }
+
+  const fuelType = getFuelTypeDefinition(fuelStatus.fuelTypeId)
+  if (fuelType === null) {
+    return '未装填推进剂'
+  }
+
+  return `推进剂: ${fuelType.displayName} | 航速 x${fuelType.speedMultiplier.toFixed(2)} | 油耗 x${fuelType.fuelPerDistanceMultiplier.toFixed(2)}`
+}
+
+function createBackpackSlot(
   parent: Rectangle,
   tooltip: TooltipManager,
-  kind: ResourceKind,
   index: number,
-): HudBackpackResourceCardHandle {
-  const ui = getResourceUi(kind)
+): HudBackpackSlotHandle {
   const { left, top } = getBackpackSlotPosition(index)
   const panel = createFixedPanel(left, top, '60px', '60px')
   panel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
@@ -2843,14 +3532,15 @@ function createBackpackResourceCard(
     left: '0px',
     parent: panel,
     size: 36,
-    source: ui.icon,
+    source: '/gui/status.svg',
     tooltip,
-    tooltipText: getKindLabel(kind),
+    tooltipText: `空背包槽 ${index + 1}`,
     tooltipWidth: '86px',
     top: '0px',
   })
+  iconHandle.icon.alpha = 0
 
-  const valueBadge = createFixedPanel('35px', '43px', '20px', '12px')
+  const valueBadge = createFixedPanel('31px', '42px', '24px', '14px')
   valueBadge.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   valueBadge.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   valueBadge.cornerRadius = 2
@@ -2858,9 +3548,10 @@ function createBackpackResourceCard(
   valueBadge.color = '#161616'
   valueBadge.background = '#242424ee'
   valueBadge.isPointerBlocker = false
+  valueBadge.isVisible = false
   panel.addControl(valueBadge)
 
-  const value = createText('0', 13, '#ffffff', 16, true)
+  const value = createText('', 13, '#ffffff', 16, true)
   value.width = '100%'
   value.height = '100%'
   value.fontSize = 9
@@ -2871,11 +3562,11 @@ function createBackpackResourceCard(
   value.outlineColor = '#111111'
   value.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   value.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
-  value.fontFamily = "'Courier New','Consolas',monospace"
+  value.fontFamily = UI_FONT_FAMILY
   valueBadge.addControl(value)
 
   const rate = createText('', 9, '#ffffff', 12, true)
-  rate.width = '28px'
+  rate.width = '32px'
   rate.height = '10px'
   rate.left = '4px'
   rate.top = '4px'
@@ -2886,106 +3577,161 @@ function createBackpackResourceCard(
   rate.outlineColor = '#111111'
   rate.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   rate.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
-  rate.fontFamily = "'Courier New','Consolas',monospace"
+  rate.fontFamily = UI_FONT_FAMILY
   panel.addControl(rate)
 
   return {
+    badge: valueBadge,
     icon: iconHandle.icon,
-    kind,
     panel,
     rate,
+    setSource: iconHandle.setSource,
+    setTooltipText: iconHandle.setTooltipText,
     value,
   }
 }
 
-function createBackpackEmptySlot(parent: Rectangle, index: number): void {
-  const { left, top } = getBackpackSlotPosition(index)
-  const panel = createFixedPanel(left, top, '60px', '60px')
+function createShipPanel(parent: AdvancedDynamicTexture): HudShipPanelHandle {
+  const panel = createFixedPanel('0px', '-110px', '420px', '360px')
   panel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  panel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
-  panel.cornerRadius = 2
+  panel.verticalAlignment = Control.VERTICAL_ALIGNMENT_BOTTOM
   panel.thickness = 2
-  panel.background = '#8b8b8bee'
-  panel.color = '#2f2f2f'
-  panel.clipChildren = true
-  panel.isPointerBlocker = false
-  parent.addControl(panel)
-}
-
-function createBackpackSpecialCard(
-  parent: Rectangle,
-  tooltip: TooltipManager,
-  index: number,
-  iconSource: string,
-  tooltipText: string,
-): HudBackpackSpecialCardHandle {
-  const { left, top } = getBackpackSlotPosition(index)
-  const panel = createFixedPanel(left, top, '60px', '60px')
-  panel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  panel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
+  panel.color = '#000000'
+  panel.background = '#c6c6c6ee'
   panel.cornerRadius = 2
-  panel.thickness = 2
-  panel.background = '#8b8b8bee'
-  panel.color = '#2f2f2f'
-  panel.clipChildren = true
-  panel.isPointerBlocker = false
+  panel.clipChildren = false
+  panel.isPointerBlocker = true
+  panel.isVisible = false
+  panel.zIndex = 1100
   parent.addControl(panel)
 
-  createIconWithTooltip({
-    iconHorizontalAlignment: Control.HORIZONTAL_ALIGNMENT_CENTER,
-    iconVerticalAlignment: Control.VERTICAL_ALIGNMENT_CENTER,
-    left: '0px',
-    parent: panel,
-    size: 36,
-    source: iconSource,
-    tooltip,
-    tooltipText,
-    tooltipWidth: '96px',
-    top: '0px',
-  })
+  const title = createText('飞船', 18, '#2a2a2a', 24, true)
+  title.width = '100%'
+  title.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  title.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
+  title.top = '10px'
+  title.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  title.outlineWidth = 0
+  title.fontFamily = UI_FONT_FAMILY
+  panel.addControl(title)
 
-  const valueBadge = createFixedPanel('35px', '43px', '20px', '12px')
-  valueBadge.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
-  valueBadge.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
-  valueBadge.cornerRadius = 2
-  valueBadge.thickness = 1
-  valueBadge.color = '#161616'
-  valueBadge.background = '#242424ee'
-  valueBadge.isPointerBlocker = false
-  panel.addControl(valueBadge)
+  const chassis = createFixedPanel('0px', '74px', '138px', '164px')
+  chassis.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  chassis.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
+  chassis.thickness = 2
+  chassis.cornerRadius = 2
+  chassis.color = '#2f2f2f'
+  chassis.background = '#b9b9b9ee'
+  chassis.isPointerBlocker = false
+  panel.addControl(chassis)
 
-  const value = createText('0', 13, '#ffffff', 16, true)
-  value.width = '100%'
-  value.height = '100%'
-  value.fontSize = 9
-  value.top = '-1px'
-  value.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  value.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
-  value.outlineWidth = 2
-  value.outlineColor = '#111111'
-  value.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  value.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
-  value.fontFamily = "'Courier New','Consolas',monospace"
-  valueBadge.addControl(value)
+  const shipIcon = new Image('ship-panel-center', '/gui/ship.svg')
+  shipIcon.width = '86px'
+  shipIcon.height = '86px'
+  shipIcon.top = '-12px'
+  shipIcon.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  shipIcon.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
+  shipIcon.isPointerBlocker = false
+  chassis.addControl(shipIcon)
 
-  const rate = createText('', 9, '#ffffff', 12, true)
-  rate.width = '28px'
-  rate.height = '10px'
-  rate.left = '4px'
-  rate.top = '4px'
-  rate.fontSize = 7
-  rate.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
-  rate.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
-  rate.outlineWidth = 1
-  rate.outlineColor = '#111111'
-  rate.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
-  rate.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
-  rate.fontFamily = "'Courier New','Consolas',monospace"
-  panel.addControl(rate)
+  const shipName = createText('勘探飞船', 12, '#1f1f1f', 18, true)
+  shipName.width = '100%'
+  shipName.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  shipName.verticalAlignment = Control.VERTICAL_ALIGNMENT_BOTTOM
+  shipName.top = '-24px'
+  shipName.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  shipName.outlineWidth = 0
+  shipName.fontFamily = UI_FONT_FAMILY
+  chassis.addControl(shipName)
+
+  const shipHint = createText('先选中携带栏物品，再点飞船空槽装载', 10, '#4d4d4d', 16, true)
+  shipHint.width = '100%'
+  shipHint.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  shipHint.verticalAlignment = Control.VERTICAL_ALIGNMENT_BOTTOM
+  shipHint.top = '-8px'
+  shipHint.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  shipHint.outlineWidth = 0
+  shipHint.fontFamily = UI_FONT_FAMILY
+  chassis.addControl(shipHint)
+
+  const slots = [
+    createShipConsoleSlot(panel, -118, 82, '挂载 1'),
+    createShipConsoleSlot(panel, '118px', 82, '挂载 2'),
+    createShipConsoleSlot(panel, -118, 188, '挂载 3'),
+    createShipConsoleSlot(panel, '118px', 188, '挂载 4'),
+    createShipConsoleSlot(panel, -70, 264, '挂载 5'),
+    createShipConsoleSlot(panel, '70px', 264, '挂载 6'),
+  ]
+
+  const status = createText('', 12, '#1f1f1f', 18, true)
+  status.width = '280px'
+  status.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  status.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
+  status.top = '324px'
+  status.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  status.outlineWidth = 0
+  status.fontFamily = UI_FONT_FAMILY
+  panel.addControl(status)
 
   return {
+    slots,
+    status,
     panel,
-    rate,
+  }
+}
+
+function createShipConsoleSlot(
+  parent: Rectangle,
+  left: number | string,
+  top: number,
+  labelText: string,
+): HudShipConsoleSlotHandle {
+  const panel = createFixedPanel(typeof left === 'number' ? `${left}px` : left, `${top}px`, '54px', '54px')
+  panel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  panel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
+  panel.cornerRadius = 2
+  panel.thickness = 2
+  panel.color = '#4f4f4f'
+  panel.background = '#8b8b8bee'
+  panel.isPointerBlocker = false
+  parent.addControl(panel)
+
+  const icon = new Image(`ship-slot-icon-${labelText}`, '')
+  icon.width = '24px'
+  icon.height = '24px'
+  icon.top = '-8px'
+  icon.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  icon.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
+  icon.isPointerBlocker = false
+  icon.alpha = 0
+  panel.addControl(icon)
+
+  const value = createText('', 10, '#ffffff', 14, true)
+  value.width = '100%'
+  value.top = '16px'
+  value.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  value.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
+  value.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  value.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
+  value.outlineWidth = 2
+  value.outlineColor = '#111111'
+  value.fontFamily = UI_FONT_FAMILY
+  panel.addControl(value)
+
+  const label = createText(labelText, 10, '#3f3f3f', 14, true)
+  label.width = '72px'
+  label.top = '56px'
+  label.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  label.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
+  label.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  label.outlineWidth = 0
+  label.fontFamily = UI_FONT_FAMILY
+  panel.addControl(label)
+
+  return {
+    icon,
+    label,
+    panel,
     value,
   }
 }
@@ -2999,7 +3745,7 @@ function createWorkshopListEntry(
   index: number,
   onClick: () => void,
 ): HudWorkshopListEntryHandle {
-  const button = createFixedPanel('0px', `${10 + index * 58}px`, '150px', '48px')
+  const button = createFixedPanel('0px', `${10 + index * 58}px`, '194px', '48px')
   button.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   button.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   button.cornerRadius = 2
@@ -3036,25 +3782,25 @@ function createWorkshopListEntry(
   })
 
   const title = createText(titleText, 12, '#1f1f1f', 16, true)
-  title.width = '92px'
+  title.width = '136px'
   title.left = '45px'
   title.top = '-7px'
   title.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   title.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   title.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   title.outlineWidth = 0
-  title.fontFamily = "'Courier New','Consolas',monospace"
+  title.fontFamily = UI_FONT_FAMILY
   button.addControl(title)
 
   const summary = createText(subtitleText, 10, '#2f2f2f', 14)
-  summary.width = '92px'
+  summary.width = '136px'
   summary.left = '45px'
   summary.top = '8px'
   summary.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   summary.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   summary.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   summary.outlineWidth = 0
-  summary.fontFamily = "'Courier New','Consolas',monospace"
+  summary.fontFamily = UI_FONT_FAMILY
   button.addControl(summary)
 
   return {
@@ -3066,8 +3812,8 @@ function createWorkshopListEntry(
 }
 
 function createRecipeCostChip(parent: Rectangle, index: number): HudRecipeCostChipHandle {
-  const columnOffset = index % 2 === 0 ? -48 : 48
-  const chip = createFixedPanel(`${columnOffset}px`, `${170 + Math.floor(index / 2) * 26}px`, '86px', '22px')
+  const columnOffset = index % 2 === 0 ? -68 : 68
+  const chip = createFixedPanel(`${columnOffset}px`, `${230 + Math.floor(index / 2) * 28}px`, '118px', '24px')
   chip.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   chip.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   chip.cornerRadius = 2
@@ -3080,22 +3826,22 @@ function createRecipeCostChip(parent: Rectangle, index: number): HudRecipeCostCh
   const icon = new Image(`recipe-chip-icon-${index}`, '/gui/resource-water.svg')
   icon.width = '12px'
   icon.height = '12px'
-  icon.left = '11px'
+  icon.left = '14px'
   icon.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   icon.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   icon.isPointerBlocker = false
   chip.addControl(icon)
 
   const value = createText('0/0', 11, '#d8e5ef', 16, true)
-  value.width = '46px'
-  value.left = '10px'
+  value.width = '74px'
+  value.left = '16px'
   value.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   value.verticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   value.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   value.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   value.outlineWidth = 0
   value.color = '#1f1f1f'
-  value.fontFamily = "'Courier New','Consolas',monospace"
+  value.fontFamily = UI_FONT_FAMILY
   chip.addControl(value)
 
   return {
@@ -3106,7 +3852,7 @@ function createRecipeCostChip(parent: Rectangle, index: number): HudRecipeCostCh
 }
 
 function createWorkshopDetailPanel(parent: Rectangle): HudWorkshopDetailHandle {
-  const panel = createFixedPanel('0px', '0px', '274px', '264px')
+  const panel = createFixedPanel('0px', '0px', '372px', '362px')
   panel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   panel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   panel.cornerRadius = 2
@@ -3118,22 +3864,26 @@ function createWorkshopDetailPanel(parent: Rectangle): HudWorkshopDetailHandle {
   parent.addControl(panel)
 
   const title = createText('', 16, '#1f1f1f', 22, true)
-  title.width = '236px'
+  title.width = '332px'
   title.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  title.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   title.top = '12px'
   title.outlineWidth = 0
-  title.fontFamily = "'Courier New','Consolas',monospace"
+  title.fontFamily = UI_FONT_FAMILY
+  title.isVisible = false
   panel.addControl(title)
 
   const summary = createText('', 11, '#2f2f2f', 16, true)
-  summary.width = '236px'
+  summary.width = '332px'
   summary.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
+  summary.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   summary.top = '36px'
   summary.outlineWidth = 0
-  summary.fontFamily = "'Courier New','Consolas',monospace"
+  summary.fontFamily = UI_FONT_FAMILY
+  summary.isVisible = false
   panel.addControl(summary)
 
-  const descriptionPanel = createFixedPanel('0px', '58px', '236px', '58px')
+  const descriptionPanel = createFixedPanel('0px', '12px', '332px', '122px')
   descriptionPanel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   descriptionPanel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   descriptionPanel.cornerRadius = 2
@@ -3144,25 +3894,25 @@ function createWorkshopDetailPanel(parent: Rectangle): HudWorkshopDetailHandle {
   panel.addControl(descriptionPanel)
 
   const descriptionLabel = createText('说明', 10, '#4a4a4a', 14, true)
-  descriptionLabel.width = '214px'
+  descriptionLabel.width = '304px'
   descriptionLabel.left = '10px'
   descriptionLabel.top = '3px'
   descriptionLabel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   descriptionLabel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   descriptionLabel.outlineWidth = 0
-  descriptionLabel.fontFamily = "'Courier New','Consolas',monospace"
+  descriptionLabel.fontFamily = UI_FONT_FAMILY
   descriptionPanel.addControl(descriptionLabel)
 
-  const description = createText('', 11, '#2f2f2f', 34)
-  description.width = '214px'
+  const description = createText('', 11, '#2f2f2f', 92)
+  description.width = '304px'
   description.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   description.top = '18px'
   description.outlineWidth = 0
-  description.textWrapping = true
-  description.fontFamily = "'Courier New','Consolas',monospace"
+  description.textWrapping = HTML_TEXT_WRAPPING
+  description.fontFamily = UI_FONT_FAMILY
   descriptionPanel.addControl(description)
 
-  const effectPanel = createFixedPanel('0px', '122px', '236px', '34px')
+  const effectPanel = createFixedPanel('0px', '142px', '332px', '82px')
   effectPanel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   effectPanel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   effectPanel.cornerRadius = 2
@@ -3173,32 +3923,32 @@ function createWorkshopDetailPanel(parent: Rectangle): HudWorkshopDetailHandle {
   panel.addControl(effectPanel)
 
   const effectLabel = createText('用途', 10, '#4a4a4a', 14, true)
-  effectLabel.width = '214px'
+  effectLabel.width = '304px'
   effectLabel.left = '10px'
   effectLabel.top = '3px'
   effectLabel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   effectLabel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   effectLabel.outlineWidth = 0
-  effectLabel.fontFamily = "'Courier New','Consolas',monospace"
+  effectLabel.fontFamily = UI_FONT_FAMILY
   effectPanel.addControl(effectLabel)
 
-  const effect = createText('', 10, '#1f1f1f', 16)
-  effect.width = '214px'
+  const effect = createText('', 10, '#1f1f1f', 58)
+  effect.width = '304px'
   effect.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   effect.top = '16px'
   effect.outlineWidth = 0
-  effect.textWrapping = true
-  effect.fontFamily = "'Courier New','Consolas',monospace"
+  effect.textWrapping = HTML_TEXT_WRAPPING
+  effect.fontFamily = UI_FONT_FAMILY
   effectPanel.addControl(effect)
 
   const materialLabel = createText('材料', 10, '#4a4a4a', 14, true)
-  materialLabel.width = '236px'
+  materialLabel.width = '332px'
   materialLabel.left = '19px'
-  materialLabel.top = '152px'
+  materialLabel.top = '232px'
   materialLabel.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   materialLabel.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   materialLabel.outlineWidth = 0
-  materialLabel.fontFamily = "'Courier New','Consolas',monospace"
+  materialLabel.fontFamily = UI_FONT_FAMILY
   panel.addControl(materialLabel)
 
   const costChips: HudRecipeCostChipHandle[] = []
@@ -3207,15 +3957,15 @@ function createWorkshopDetailPanel(parent: Rectangle): HudWorkshopDetailHandle {
   }
 
   const status = createText('', 11, '#1f1f1f', 18, true)
-  status.width = '236px'
+  status.width = '332px'
   status.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  status.top = '224px'
+  status.top = '306px'
   status.outlineWidth = 0
   status.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  status.fontFamily = "'Courier New','Consolas',monospace"
+  status.fontFamily = UI_FONT_FAMILY
   panel.addControl(status)
 
-  const button = createFixedPanel('0px', '240px', '236px', '18px')
+  const button = createFixedPanel('0px', '332px', '332px', '24px')
   button.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   button.verticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
   button.cornerRadius = 2
@@ -3232,16 +3982,16 @@ function createWorkshopDetailPanel(parent: Rectangle): HudWorkshopDetailHandle {
   buttonLabel.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   buttonLabel.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_CENTER
   buttonLabel.outlineWidth = 0
-  buttonLabel.fontFamily = "'Courier New','Consolas',monospace"
+  buttonLabel.fontFamily = UI_FONT_FAMILY
   button.addControl(buttonLabel)
 
   const emptyState = createText('没有匹配的配方', 12, '#2f2f2f', 18, true)
-  emptyState.width = '236px'
+  emptyState.width = '332px'
   emptyState.horizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
-  emptyState.top = '120px'
+  emptyState.top = '168px'
   emptyState.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_CENTER
   emptyState.outlineWidth = 0
-  emptyState.fontFamily = "'Courier New','Consolas',monospace"
+  emptyState.fontFamily = UI_FONT_FAMILY
   emptyState.isVisible = false
   panel.addControl(emptyState)
 
@@ -3289,8 +4039,8 @@ function updateWorkshopDetailPanel(
   }
 
   handle.emptyState.isVisible = false
-  handle.title.isVisible = true
-  handle.summary.isVisible = true
+  handle.title.isVisible = false
+  handle.summary.isVisible = false
   handle.description.isVisible = true
   handle.effect.isVisible = true
   handle.status.isVisible = true
@@ -3387,19 +4137,20 @@ function createText(
   bold = false,
 ): TextBlock {
   const block = new TextBlock()
+  const minHeight = fontSize + 4
   block.text = text
   block.color = color
   block.fontSize = fontSize
-  block.height = `${height}px`
+  block.height = `${Math.max(height, minHeight)}px`
   block.textWrapping = true
   block.resizeToFit = false
   block.outlineWidth = 1
   block.outlineColor = '#040711ee'
   block.textHorizontalAlignment = Control.HORIZONTAL_ALIGNMENT_LEFT
   block.textVerticalAlignment = Control.VERTICAL_ALIGNMENT_TOP
-  block.paddingTop = '2px'
-  block.paddingBottom = '2px'
-  block.fontFamily = "'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif"
+  block.paddingTop = '0px'
+  block.paddingBottom = '0px'
+  block.fontFamily = UI_FONT_FAMILY
   if (bold) {
     block.fontWeight = '700'
   }
@@ -3425,6 +4176,134 @@ function createEmptyInventory(): ResourceInventory {
   }
 }
 
+function findBackpackSlotIndex(
+  slots: (CarrySlotItem | null)[],
+  itemId: CarryItemId,
+): number {
+  return slots.findIndex((slot) => slot !== null && slot.itemId === itemId && slot.amount > 1e-6)
+}
+
+function getBackpackItemCount(
+  slots: (CarrySlotItem | null)[],
+  itemId: CarryItemId,
+): number {
+  let total = 0
+  for (const slot of slots) {
+    if (slot === null || slot.itemId !== itemId) {
+      continue
+    }
+
+    total += slot.amount
+  }
+
+  return total
+}
+
+function getBackpackResourceInventory(
+  slots: (CarrySlotItem | null)[],
+): ResourceInventory {
+  const inventory = createEmptyInventory()
+  for (const slot of slots) {
+    if (slot === null || slot.itemId === 'harvester') {
+      continue
+    }
+
+    inventory[slot.itemId] += slot.amount
+  }
+
+  return inventory
+}
+
+function addItemToBackpackSlots(
+  slots: (CarrySlotItem | null)[],
+  itemId: CarryItemId,
+  amount: number,
+  preferredSlotIndex?: number,
+): boolean {
+  if (amount <= 1e-6) {
+    return true
+  }
+
+  if (preferredSlotIndex !== undefined && preferredSlotIndex >= 0 && preferredSlotIndex < slots.length) {
+    const preferredSlot = slots[preferredSlotIndex]
+    if (preferredSlot === null) {
+      slots[preferredSlotIndex] = {
+        amount,
+        itemId,
+      }
+      return true
+    }
+
+    if (preferredSlot.itemId === itemId) {
+      preferredSlot.amount += amount
+      return true
+    }
+
+    return false
+  }
+
+  const existingSlotIndex = findBackpackSlotIndex(slots, itemId)
+  if (existingSlotIndex !== -1) {
+    slots[existingSlotIndex]!.amount += amount
+    return true
+  }
+
+  const targetSlotIndex = slots.findIndex((slot) => slot === null)
+
+  if (targetSlotIndex === -1) {
+    return false
+  }
+
+  slots[targetSlotIndex] = {
+    amount,
+    itemId,
+  }
+  return true
+}
+
+function removeItemFromBackpackSlots(
+  slots: (CarrySlotItem | null)[],
+  itemId: CarryItemId,
+  amount: number,
+): number {
+  if (amount <= 1e-6) {
+    return 0
+  }
+
+  let remaining = amount
+  let removed = 0
+  for (let index = 0; index < slots.length; index += 1) {
+    const slot = slots[index]
+    if (slot === null || slot.itemId !== itemId || remaining <= 1e-6) {
+      continue
+    }
+
+    const delta = Math.min(slot.amount, remaining)
+    slot.amount -= delta
+    remaining -= delta
+    removed += delta
+    if (slot.amount <= 1e-6) {
+      slots[index] = null
+    }
+  }
+
+  return removed
+}
+
+function spendBackpackInventory(
+  slots: (CarrySlotItem | null)[],
+  cost: UpgradeCost,
+): void {
+  for (const kind of RESOURCE_KINDS) {
+    const required = cost[kind] ?? 0
+    if (required <= 0) {
+      continue
+    }
+
+    removeItemFromBackpackSlots(slots, kind, required)
+  }
+}
+
 function hasInventory(inventory: ResourceInventory, cost: UpgradeCost): boolean {
   for (const kind of RESOURCE_KINDS) {
     const required = cost[kind] ?? 0
@@ -3434,17 +4313,6 @@ function hasInventory(inventory: ResourceInventory, cost: UpgradeCost): boolean 
   }
 
   return true
-}
-
-function spendInventory(inventory: ResourceInventory, cost: UpgradeCost): void {
-  for (const kind of RESOURCE_KINDS) {
-    const required = cost[kind] ?? 0
-    if (required <= 0) {
-      continue
-    }
-
-    inventory[kind] = Math.max(0, inventory[kind] - required)
-  }
 }
 
 function formatUpgradeCost(cost: UpgradeCost): string {
